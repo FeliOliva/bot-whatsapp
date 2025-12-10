@@ -1,1 +1,5 @@
 node_modules
+auth_info/
+*.tar.gz
+*.log
+.env

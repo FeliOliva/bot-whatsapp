@@ -20,12 +20,17 @@ const TZ = process.env.TZ || "America/Argentina/Cordoba";
 const HORA_RECORDATORIO = "30 23 * * *"; // 23:30 todos los días
 
 // Cadencia del ciclo de recordatorios
-const REMINDER_EVERY_MIN = 5;     // cada 5 minutos
+const REMINDER_EVERY_MIN = 10;     // cada 10 minutos
 const REMINDER_MAX_ATTEMPTS = 48; // tope (4 horas). Podés subir/bajar o usar Infinity
+
+// Horario de funcionamiento
+const HORA_INICIO = { hour: 23, minute: 30 }; // 23:30
+const HORA_FIN = { hour: 2, minute: 30 };     // 02:30
 
 // Mensajes
 const MSG_CONFIRMACION = "bueno carlo, te amo ❤️";
 const MSG_RECORDATORIO = "💊 Acordate la pastilla Carlooo!!!";
+const MSG_FIN_HORARIO = "Bueno carlo sino quere no la tome 😡";
 
 // Logger
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -34,12 +39,28 @@ const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 let sock = null;
 let saveCreds = null;
 let scheduledJob = null;
+let scheduledStopJob = null; // Job para detener a las 02:30
 let lastQR = null;
 
 // Estado del ciclo de recordatorios
 let awaitingAck = false;
 let reminderTimer = null;
 let reminderAttempts = 0;
+
+// --- Helpers: verificación de horario ---
+function isWithinOperatingHours() {
+  const now = new Date();
+  const hour = now.getHours();
+  const minute = now.getMinutes();
+  const currentTime = hour * 60 + minute;
+  
+  // Horario: 23:30 (1410 minutos) hasta 02:30 (150 minutos del día siguiente)
+  const startTime = HORA_INICIO.hour * 60 + HORA_INICIO.minute; // 1410
+  const endTime = HORA_FIN.hour * 60 + HORA_FIN.minute; // 150
+  
+  // Si estamos después de las 23:30 (hasta medianoche) o antes de las 02:30
+  return currentTime >= startTime || currentTime < endTime;
+}
 
 // --- Helpers: ciclo de recordatorios ---
 async function startReminderCycle() {
@@ -60,6 +81,13 @@ async function startReminderCycle() {
 
   reminderTimer = setInterval(async () => {
     try {
+      // Verificar si aún estamos dentro del horario permitido
+      if (!isWithinOperatingHours()) {
+        logger.warn("⏹️ Fuera del horario permitido; deteniendo ciclo.");
+        await stopReminderCycleWithMessage("horario");
+        return;
+      }
+      
       if (!awaitingAck) {
         clearInterval(reminderTimer);
         reminderTimer = null;
@@ -90,13 +118,31 @@ function stopReminderCycle(reason = "ack") {
   logger.info(`⏹️ Ciclo de recordatorios detenido (${reason}).`);
 }
 
-// --- Programación diaria (arranca el ciclo a las 23:30) ---
+async function stopReminderCycleWithMessage(reason = "ack") {
+  stopReminderCycle(reason);
+  if (sock && reason === "horario") {
+    try {
+      await sock.sendMessage(CHAT_ID_AUT, { text: MSG_FIN_HORARIO });
+      logger.info("📤 Mensaje de fin de horario enviado.");
+    } catch (err) {
+      logger.error({ err }, "Error enviando mensaje de fin de horario");
+    }
+  }
+}
+
+// --- Programación diaria (arranca el ciclo a las 23:30, lo detiene a las 02:30) ---
 function programarRecordatorio() {
   if (scheduledJob) {
     try { scheduledJob.cancel(); } catch {}
     scheduledJob = null;
   }
+  
+  if (scheduledStopJob) {
+    try { scheduledStopJob.cancel(); } catch {}
+    scheduledStopJob = null;
+  }
 
+  // Job para iniciar a las 23:30
   scheduledJob = schedule.scheduleJob(HORA_RECORDATORIO, async () => {
     if (!sock) {
       logger.warn("No hay socket activo al programar; reintentando en 10s...");
@@ -106,7 +152,18 @@ function programarRecordatorio() {
     await startReminderCycle();
   });
 
-  logger.info(`⏰ Ciclo diario programado (${HORA_RECORDATORIO}) TZ=${TZ}`);
+  // Job para detener a las 02:30
+  const stopSchedule = `${HORA_FIN.minute} ${HORA_FIN.hour} * * *`;
+  scheduledStopJob = schedule.scheduleJob(stopSchedule, async () => {
+    if (!sock) {
+      logger.warn("No hay socket activo al intentar detener ciclo.");
+      return;
+    }
+    logger.info("⏰ Hora de detener ciclo (02:30) alcanzada.");
+    await stopReminderCycleWithMessage("horario");
+  });
+
+  logger.info(`⏰ Ciclo diario programado: inicio ${HORA_RECORDATORIO}, fin ${stopSchedule} TZ=${TZ}`);
 }
 
 // --- Arranque / Reconexión ---
@@ -203,6 +260,11 @@ async function start() {
       const listo = typeof text === "string" && /\blisto\b/i.test(text);
 
       if (listo) {
+        // Solo responder si estamos dentro del horario permitido
+        if (!isWithinOperatingHours()) {
+          logger.info("📵 Mensaje 'Listo' recibido fuera del horario permitido; ignorando.");
+          return;
+        }
         stopReminderCycle("ack");
         await sock.sendMessage(chatId, { text: MSG_CONFIRMACION });
       }
@@ -216,6 +278,7 @@ async function start() {
     try {
       logger.info(`Recibí ${signal}, cerrando socket...`);
       if (scheduledJob) scheduledJob.cancel();
+      if (scheduledStopJob) scheduledStopJob.cancel();
       stopReminderCycle("signal");
       if (sock) {
         await sock.ws.close();
