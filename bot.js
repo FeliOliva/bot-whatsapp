@@ -81,16 +81,17 @@ async function startReminderCycle() {
 
   reminderTimer = setInterval(async () => {
     try {
+      // Verificar si el ciclo ya fue detenido por el usuario
+      if (!awaitingAck) {
+        clearInterval(reminderTimer);
+        reminderTimer = null;
+        return;
+      }
+      
       // Verificar si aún estamos dentro del horario permitido
       if (!isWithinOperatingHours()) {
         logger.warn("⏹️ Fuera del horario permitido; deteniendo ciclo.");
         await stopReminderCycleWithMessage("horario");
-        return;
-      }
-      
-      if (!awaitingAck) {
-        clearInterval(reminderTimer);
-        reminderTimer = null;
         return;
       }
       if (reminderAttempts >= REMINDER_MAX_ATTEMPTS) {
@@ -119,8 +120,10 @@ function stopReminderCycle(reason = "ack") {
 }
 
 async function stopReminderCycleWithMessage(reason = "ack") {
+  // Solo enviar mensaje si el ciclo estaba activo
+  const wasActive = awaitingAck;
   stopReminderCycle(reason);
-  if (sock && reason === "horario") {
+  if (sock && reason === "horario" && wasActive) {
     try {
       await sock.sendMessage(CHAT_ID_AUT, { text: MSG_FIN_HORARIO });
       logger.info("📤 Mensaje de fin de horario enviado.");
@@ -160,7 +163,14 @@ function programarRecordatorio() {
       return;
     }
     logger.info("⏰ Hora de detener ciclo (02:30) alcanzada.");
-    await stopReminderCycleWithMessage("horario");
+    // Solo enviar mensaje si el ciclo sigue activo (usuario no cortó con "listo")
+    if (awaitingAck) {
+      await stopReminderCycleWithMessage("horario");
+    } else {
+      // El ciclo ya fue detenido por el usuario, solo limpiar sin enviar mensaje
+      stopReminderCycle("horario");
+      logger.info("⏹️ Ciclo ya estaba detenido por el usuario; no se envía mensaje de fin de horario.");
+    }
   });
 
   logger.info(`⏰ Ciclo diario programado: inicio ${HORA_RECORDATORIO}, fin ${stopSchedule} TZ=${TZ}`);
