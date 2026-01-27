@@ -31,6 +31,7 @@ const HORA_FIN = { hour: 2, minute: 30 };     // 02:30
 const MSG_CONFIRMACION = "bueno carlo, te amo ❤️";
 const MSG_RECORDATORIO = "💊 Acordate la pastilla Carlooo!!!";
 const MSG_FIN_HORARIO = "Bueno carlo sino quere no la tome 😡";
+const MSG_FUERA_HORARIO = "No estoy trabajando en este momento🤖🧰";
 
 // Logger
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -53,11 +54,11 @@ function isWithinOperatingHours() {
   const hour = now.getHours();
   const minute = now.getMinutes();
   const currentTime = hour * 60 + minute;
-  
+
   // Horario: 23:30 (1410 minutos) hasta 02:30 (150 minutos del día siguiente)
   const startTime = HORA_INICIO.hour * 60 + HORA_INICIO.minute; // 1410
   const endTime = HORA_FIN.hour * 60 + HORA_FIN.minute; // 150
-  
+
   // Si estamos después de las 23:30 (hasta medianoche) o antes de las 02:30
   return currentTime >= startTime || currentTime < endTime;
 }
@@ -87,7 +88,7 @@ async function startReminderCycle() {
         reminderTimer = null;
         return;
       }
-      
+
       // Verificar si aún estamos dentro del horario permitido
       if (!isWithinOperatingHours()) {
         logger.warn("⏹️ Fuera del horario permitido; deteniendo ciclo.");
@@ -136,12 +137,12 @@ async function stopReminderCycleWithMessage(reason = "ack") {
 // --- Programación diaria (arranca el ciclo a las 23:30, lo detiene a las 02:30) ---
 function programarRecordatorio() {
   if (scheduledJob) {
-    try { scheduledJob.cancel(); } catch {}
+    try { scheduledJob.cancel(); } catch { }
     scheduledJob = null;
   }
-  
+
   if (scheduledStopJob) {
-    try { scheduledStopJob.cancel(); } catch {}
+    try { scheduledStopJob.cancel(); } catch { }
     scheduledStopJob = null;
   }
 
@@ -273,6 +274,7 @@ async function start() {
         // Solo responder si estamos dentro del horario permitido
         if (!isWithinOperatingHours()) {
           logger.info("📵 Mensaje 'Listo' recibido fuera del horario permitido; ignorando.");
+          await sock.sendMessage(chatId, { text: MSG_FUERA_HORARIO });
           return;
         }
         stopReminderCycle("ack");
