@@ -31,7 +31,7 @@ const HORA_FIN = { hour: 2, minute: 30 };     // 02:30
 const MSG_CONFIRMACION = "bueno carlo, te amo ❤️";
 const MSG_RECORDATORIO = "💊 Acordate la pastilla Carlooo!!!";
 const MSG_FIN_HORARIO = "Bueno carlo sino quere no la tome 😡";
-const MSG_FUERA_HORARIO = "No estoy trabajando en este momento🤖🧰";
+const MSG_FUERA_HORARIO = "No estoy laburando en este momento carlo🤖🧰";
 
 // Logger
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
@@ -185,7 +185,33 @@ async function start() {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
+    areJidsSameUser,
+    isJidBroadcast,
+    isJidGroup,
+    isLidUser,
+    jidNormalizedUser,
   } = await import("@whiskeysockets/baileys");
+
+  // --- Helpers: normalización de JID (PN vs LID) ---
+  async function resolveUserJid(rawJid) {
+    if (!rawJid) return "";
+    const normalized = jidNormalizedUser(rawJid);
+    if (!sock?.signalRepository?.lidMapping) return normalized;
+    if (isLidUser(normalized)) {
+      const pn = await sock.signalRepository.lidMapping.getPNForLID(normalized);
+      return pn ? jidNormalizedUser(pn) : normalized;
+    }
+    return normalized;
+  }
+
+  function getAuthorJid(msg) {
+    const remoteJid = msg?.key?.remoteJid;
+    if (!remoteJid) return "";
+    if (isJidGroup(remoteJid)) {
+      return msg.key?.participant || "";
+    }
+    return remoteJid;
+  }
 
   const { state, saveCreds: saveCredsFn } = await useMultiFileAuthState(AUTH_DIR);
   saveCreds = saveCredsFn;
@@ -249,16 +275,25 @@ async function start() {
       const msg = messages[0];
 
       // 1) Ignorar mensajes sin contenido útil o de status
-      if (!msg.message || msg.key?.remoteJid === "status@broadcast") return;
+      if (!msg.message || isJidBroadcast(msg.key?.remoteJid)) return;
 
       // 2) Ignorar mensajes enviados por el propio bot
       if (msg.key?.fromMe) return;
 
       const chatId = msg.key.remoteJid;
+      if (isJidGroup(chatId)) return;
 
       // 3) Responder SOLO si viene del contacto autorizado y no es grupo
-      if (chatId !== CHAT_ID_AUT) return;
-      if (chatId.endsWith("@g.us")) return;
+      const authorJid = await resolveUserJid(getAuthorJid(msg));
+      const authJid = jidNormalizedUser(CHAT_ID_AUT);
+      if (!areJidsSameUser(authorJid, authJid)) return;
+
+      // 3.1) Ignorar mensajes propios aunque lleguen sin fromMe
+      const selfJid = sock?.user?.id ? await resolveUserJid(sock.user.id) : "";
+      if (selfJid && areJidsSameUser(authorJid, selfJid)) return;
+
+      console.log("MSG FROM:", msg.key.remoteJid);
+      console.log("TEXT RAW:", msg.message);
 
       // 4) Extraer texto
       const text =
