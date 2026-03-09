@@ -10,6 +10,8 @@ const schedule = require("node-schedule");
 const { Boom } = require("@hapi/boom");
 const pino = require("pino");
 const qrcode = require("qrcode-terminal");
+const fs = require("fs");
+const path = require("path");
 
 // --- Config ---
 const AUTH_DIR = "auth_info"; // credenciales persistentes
@@ -47,6 +49,13 @@ let lastQR = null;
 let awaitingAck = false;
 let reminderTimer = null;
 let reminderAttempts = 0;
+
+// Estado de reconexión
+const MAX_RECONNECT_ATTEMPTS = 5;
+let reconnectAttempts = 0;
+let reconnectTimeout = null;
+let isStarting = false;
+let hasRegisteredProcessHandlers = false;
 
 // --- Helpers: verificación de horario ---
 function isWithinOperatingHours() {
@@ -177,8 +186,58 @@ function programarRecordatorio() {
   logger.info(`⏰ Ciclo diario programado: inicio ${HORA_RECORDATORIO}, fin ${stopSchedule} TZ=${TZ}`);
 }
 
+// --- Helpers: conexión / reconexión segura ---
+function clearAuthDir() {
+  try {
+    const authPath = path.resolve(AUTH_DIR);
+    if (fs.existsSync(authPath)) {
+      fs.rmSync(authPath, { recursive: true, force: true });
+      logger.warn(`🧹 Credenciales eliminadas en ${authPath}`);
+    }
+  } catch (err) {
+    logger.error({ err }, "Error eliminando credenciales");
+  }
+}
+
+async function closeCurrentSocket(reason = "close") {
+  try {
+    logger.info({ reason }, "Cerrando socket y limpiando recursos...");
+    if (scheduledJob) {
+      scheduledJob.cancel();
+      scheduledJob = null;
+    }
+    if (scheduledStopJob) {
+      scheduledStopJob.cancel();
+      scheduledStopJob = null;
+    }
+    stopReminderCycle(reason);
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners("connection.update");
+        sock.ev.removeAllListeners("creds.update");
+        sock.ev.removeAllListeners("messages.upsert");
+      } catch (e) {
+        logger.warn({ e }, "No se pudieron limpiar algunos listeners del socket");
+      }
+      if (sock.ws) {
+        await sock.ws.close();
+      }
+      sock = null;
+    }
+  } catch (err) {
+    logger.error({ err }, "Error cerrando socket");
+  }
+}
+
 // --- Arranque / Reconexión ---
 async function start() {
+  if (isStarting) {
+    logger.warn("start() ya en ejecución; ignorando llamada duplicada.");
+    return;
+  }
+  isStarting = true;
+
+  try {
   // ⬇️ Import dinámico de Baileys (ESM) dentro de CommonJS
   const {
     default: makeWASocket,
@@ -252,6 +311,11 @@ async function start() {
 
     if (connection === "open") {
       logger.info("✅ Bot conectado a WhatsApp");
+      reconnectAttempts = 0;
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
       lastQR = null;
       programarRecordatorio();
     }
@@ -260,11 +324,49 @@ async function start() {
       const status = new Boom(lastDisconnect?.error)?.output?.statusCode;
       logger.warn({ reason: status }, "⚠️ Conexión cerrada");
 
-      // Si la sesión está inválida, vas a necesitar borrar auth_info y re-vincular
-      if (status === DisconnectReason.loggedOut || status === 405 || status === 499) {
-        logger.error("❌ Sesión inválida/rota. Borrá 'auth_info' y re-vinculá con QR.");
+      const isLoggedOut =
+        status === DisconnectReason.loggedOut ||
+        status === 401;
+
+      if (isLoggedOut) {
+        logger.error(
+          "❌ Sesión inválida (401/loggedOut). Eliminando credenciales y deteniendo reconexiones automáticas."
+        );
+        clearAuthDir();
+        await closeCurrentSocket("loggedOut");
+        // No reintentamos; se deberá reiniciar el proceso manualmente.
+        return;
       }
-      setTimeout(start, 3000);
+
+      if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        logger.error(
+          { attempts: reconnectAttempts },
+          "❌ Máximo de intentos de reconexión alcanzado. No se seguirán realizando intentos."
+        );
+        await closeCurrentSocket("max_retries");
+        return;
+      }
+
+      reconnectAttempts += 1;
+      const delay = Math.min(30_000, 1000 * Math.pow(2, reconnectAttempts - 1));
+      logger.info(
+        { attempts: reconnectAttempts, delay },
+        "🔁 Programando intento de reconexión"
+      );
+
+      if (reconnectTimeout) {
+        clearTimeout(reconnectTimeout);
+        reconnectTimeout = null;
+      }
+
+      await closeCurrentSocket("reconnect");
+
+      reconnectTimeout = setTimeout(() => {
+        reconnectTimeout = null;
+        start().catch((err) => {
+          logger.error({ err }, "Error al reintentar la conexión");
+        });
+      }, delay);
     }
   });
 
@@ -321,26 +423,27 @@ async function start() {
   });
 
   // Cierre limpio al recibir señales (PM2, etc.)
-  const cleanup = async (signal) => {
-    try {
-      logger.info(`Recibí ${signal}, cerrando socket...`);
-      if (scheduledJob) scheduledJob.cancel();
-      if (scheduledStopJob) scheduledStopJob.cancel();
-      stopReminderCycle("signal");
-      if (sock) {
-        await sock.ws.close();
-        sock = null;
+  if (!hasRegisteredProcessHandlers) {
+    const cleanup = async (signal) => {
+      try {
+        logger.info(`Recibí ${signal}, cerrando socket...`);
+        await closeCurrentSocket(`signal:${signal}`);
+        process.exit(0);
+      } catch {
+        process.exit(1);
       }
-      process.exit(0);
-    } catch {
-      process.exit(1);
-    }
-  };
+    };
 
-  process.removeAllListeners("SIGINT");
-  process.removeAllListeners("SIGTERM");
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+    process.on("SIGINT", cleanup);
+    process.on("SIGTERM", cleanup);
+    hasRegisteredProcessHandlers = true;
+  }
+} catch (err) {
+  logger.error({ err }, "Error en start()");
+  throw err;
+} finally {
+  isStarting = false;
+}
 }
 
 // Iniciar
