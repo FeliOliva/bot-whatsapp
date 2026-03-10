@@ -382,6 +382,9 @@ async function start() {
       // 2) Ignorar mensajes enviados por el propio bot
       if (msg.key?.fromMe) return;
 
+      // 2.1) Fuera de horario: ignorar todo sin logs ni respuestas
+      if (!isWithinOperatingHours()) return;
+
       const chatId = msg.key.remoteJid;
       if (isJidGroup(chatId)) return;
 
