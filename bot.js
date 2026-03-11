@@ -29,6 +29,10 @@ const REMINDER_MAX_ATTEMPTS = 48; // tope (4 horas). Podés subir/bajar o usar I
 const HORA_INICIO = { hour: 23, minute: 30 }; // 23:30
 const HORA_FIN = { hour: 2, minute: 30 };     // 02:30
 
+// Ventana de conexión (conecta 23:29, desconecta 02:31)
+const HORA_CONECTAR = { hour: 23, minute: 29 };
+const HORA_DESCONECTAR = { hour: 2, minute: 31 };
+
 // Mensajes
 const MSG_CONFIRMACION = "bueno carlo, te amo ❤️";
 const MSG_RECORDATORIO = "💊 Acordate la pastilla Carlooo!!!";
@@ -43,6 +47,8 @@ let sock = null;
 let saveCreds = null;
 let scheduledJob = null;
 let scheduledStopJob = null; // Job para detener a las 02:30
+let scheduledConnectJob = null;
+let scheduledDisconnectJob = null;
 let lastQR = null;
 
 // Estado del ciclo de recordatorios
@@ -186,6 +192,34 @@ function programarRecordatorio() {
   logger.info(`⏰ Ciclo diario programado: inicio ${HORA_RECORDATORIO}, fin ${stopSchedule} TZ=${TZ}`);
 }
 
+// --- Programación de conexión (conecta 23:29, desconecta 02:31) ---
+function programarConexion() {
+  if (scheduledConnectJob) {
+    try { scheduledConnectJob.cancel(); } catch { }
+    scheduledConnectJob = null;
+  }
+  if (scheduledDisconnectJob) {
+    try { scheduledDisconnectJob.cancel(); } catch { }
+    scheduledDisconnectJob = null;
+  }
+
+  const connectSchedule = `${HORA_CONECTAR.minute} ${HORA_CONECTAR.hour} * * *`;
+  scheduledConnectJob = schedule.scheduleJob(connectSchedule, () => {
+    logger.info("⏰ Hora de conectar alcanzada.");
+    start().catch((err) => logger.error({ err }, "Error al conectar programado"));
+  });
+
+  const disconnectSchedule = `${HORA_DESCONECTAR.minute} ${HORA_DESCONECTAR.hour} * * *`;
+  scheduledDisconnectJob = schedule.scheduleJob(disconnectSchedule, async () => {
+    logger.info("⏰ Hora de desconectar alcanzada.");
+    await closeCurrentSocket("scheduled_disconnect");
+  });
+
+  logger.info(
+    `⏰ Conexión programada: conecta ${connectSchedule}, desconecta ${disconnectSchedule} TZ=${TZ}`
+  );
+}
+
 // --- Helpers: conexión / reconexión segura ---
 function clearAuthDir() {
   try {
@@ -288,6 +322,8 @@ async function start() {
     connectTimeoutMs: 60_000,
     keepAliveIntervalMs: 15_000,
     syncFullHistory: false,
+    markOnlineOnConnect: false,
+    emitOwnEvents: false,
   });
 
   // Guardar credenciales cuando cambian
@@ -323,6 +359,12 @@ async function start() {
     if (connection === "close") {
       const status = new Boom(lastDisconnect?.error)?.output?.statusCode;
       logger.warn({ reason: status }, "⚠️ Conexión cerrada");
+
+      if (!isWithinOperatingHours()) {
+        logger.info("🕒 Fuera de horario; no se reintentará conexión.");
+        await closeCurrentSocket("out_of_hours");
+        return;
+      }
 
       const isLoggedOut =
         status === DisconnectReason.loggedOut ||
@@ -449,9 +491,14 @@ async function start() {
 }
 }
 
-// Iniciar
-start().catch((err) => {
-  console.error("Fallo al iniciar el bot:", err);
-  process.exit(1);
-});
+// Iniciar (solo en ventana horaria) + programar conexión
+programarConexion();
+if (isWithinOperatingHours()) {
+  start().catch((err) => {
+    console.error("Fallo al iniciar el bot:", err);
+    process.exit(1);
+  });
+} else {
+  logger.info("🕒 Fuera de horario: el bot esperará al próximo horario de conexión.");
+}
 
