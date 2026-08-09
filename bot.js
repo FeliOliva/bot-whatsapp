@@ -64,18 +64,34 @@ let isStarting = false;
 let hasRegisteredProcessHandlers = false;
 
 // --- Helpers: verificación de horario ---
-function isWithinOperatingHours() {
+function isWithinWindow(inicio, fin) {
   const now = new Date();
-  const hour = now.getHours();
-  const minute = now.getMinutes();
-  const currentTime = hour * 60 + minute;
-
-  // Horario: 23:30 (1410 minutos) hasta 02:30 (150 minutos del día siguiente)
-  const startTime = HORA_INICIO.hour * 60 + HORA_INICIO.minute; // 1410
-  const endTime = HORA_FIN.hour * 60 + HORA_FIN.minute; // 150
-
-  // Si estamos después de las 23:30 (hasta medianoche) o antes de las 02:30
+  const currentTime = now.getHours() * 60 + now.getMinutes();
+  const startTime = inicio.hour * 60 + inicio.minute;
+  const endTime = fin.hour * 60 + fin.minute;
   return currentTime >= startTime || currentTime < endTime;
+}
+
+// Ventana de RECORDATORIOS (23:30–02:30) — para decidir si seguir mandando
+// recordatorios y si responder a mensajes entrantes.
+function isWithinOperatingHours() {
+  return isWithinWindow(HORA_INICIO, HORA_FIN);
+}
+
+// Ventana de CONEXIÓN (23:29–02:31) — un minuto más ancha a cada lado que la
+// de arriba a propósito (HORA_CONECTAR/HORA_DESCONECTAR): el socket se
+// conecta a las 23:29 para estar listo antes de que arranquen los
+// recordatorios a las 23:30. Si se usa isWithinOperatingHours() para decidir
+// si reintentar una conexión caída, cualquier corte que ocurra justo en ese
+// minuto de margen (23:29:00–23:29:59) se toma como "fuera de horario, no
+// reintentar" SIN IMPORTAR el motivo real del corte — así fue como una
+// sesión deslogueada (401) el 07/08 quedó enmascarada como "fuera de
+// horario" en vez de detectarse como sesión inválida, y el bot se quedó sin
+// mandar recordatorios esa noche sin ningún aviso claro. Todo lo que decide
+// si vale la pena mantener/reintentar el socket tiene que usar esta ventana
+// más ancha, no la de recordatorios.
+function isWithinConnectionWindow() {
+  return isWithinWindow(HORA_CONECTAR, HORA_DESCONECTAR);
 }
 
 // --- Helpers: ciclo de recordatorios ---
@@ -360,7 +376,7 @@ async function start() {
       const status = new Boom(lastDisconnect?.error)?.output?.statusCode;
       logger.warn({ reason: status }, "⚠️ Conexión cerrada");
 
-      if (!isWithinOperatingHours()) {
+      if (!isWithinConnectionWindow()) {
         logger.info("🕒 Fuera de horario; no se reintentará conexión.");
         await closeCurrentSocket("out_of_hours");
         return;
@@ -493,7 +509,7 @@ async function start() {
 
 // Iniciar (solo en ventana horaria) + programar conexión
 programarConexion();
-if (isWithinOperatingHours()) {
+if (isWithinConnectionWindow()) {
   start().catch((err) => {
     console.error("Fallo al iniciar el bot:", err);
     process.exit(1);
@@ -501,4 +517,3 @@ if (isWithinOperatingHours()) {
 } else {
   logger.info("🕒 Fuera de horario: el bot esperará al próximo horario de conexión.");
 }
-
