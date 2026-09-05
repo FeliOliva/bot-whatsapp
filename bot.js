@@ -56,6 +56,23 @@ let awaitingAck = false;
 let reminderTimer = null;
 let reminderAttempts = 0;
 
+// --- Dedupe de mensajes entrantes ---
+// WhatsApp/Baileys puede reentregar el mismo mensaje (retries, reconexiones),
+// lo que hacía que "listo" se procesara 2 o 3 veces y el bot conteste
+// "bueno carlo, te amo" repetido. Se descarta cualquier msg.key.id ya visto.
+const PROCESSED_IDS_MAX = 200;
+const processedMsgIds = new Set();
+function alreadyProcessed(msgId) {
+  if (!msgId) return false; // sin id no podemos dedupear, dejamos pasar
+  if (processedMsgIds.has(msgId)) return true;
+  processedMsgIds.add(msgId);
+  if (processedMsgIds.size > PROCESSED_IDS_MAX) {
+    const oldest = processedMsgIds.values().next().value;
+    processedMsgIds.delete(oldest);
+  }
+  return false;
+}
+
 // Estado de reconexión
 const MAX_RECONNECT_ATTEMPTS = 5;
 let reconnectAttempts = 0;
@@ -95,6 +112,37 @@ function isWithinConnectionWindow() {
 }
 
 // --- Helpers: ciclo de recordatorios ---
+async function reminderTick() {
+  try {
+    // Verificar si el ciclo ya fue detenido por el usuario
+    if (!awaitingAck) {
+      clearInterval(reminderTimer);
+      reminderTimer = null;
+      return;
+    }
+
+    // Verificar si aún estamos dentro del horario permitido
+    if (!isWithinOperatingHours()) {
+      logger.warn("⏹️ Fuera del horario permitido; deteniendo ciclo.");
+      await stopReminderCycleWithMessage("horario");
+      return;
+    }
+    if (reminderAttempts >= REMINDER_MAX_ATTEMPTS) {
+      logger.warn("⏹️ Tope de recordatorios alcanzado; deteniendo ciclo por hoy.");
+      clearInterval(reminderTimer);
+      reminderTimer = null;
+      awaitingAck = false;
+      return;
+    }
+    if (!sock) return; // socket caído en este instante; el próximo tick reintenta
+    reminderAttempts++;
+    await sock.sendMessage(CHAT_ID_AUT, { text: MSG_RECORDATORIO });
+    logger.info(`📤 Recordatorio #${reminderAttempts} enviado.`);
+  } catch (err) {
+    logger.error({ err }, "Error enviando recordatorio periódico");
+  }
+}
+
 async function startReminderCycle() {
   // limpiar intervalos previos si los hubiera
   if (reminderTimer) {
@@ -111,35 +159,33 @@ async function startReminderCycle() {
     logger.error({ err }, "Error enviando recordatorio inicial");
   }
 
-  reminderTimer = setInterval(async () => {
-    try {
-      // Verificar si el ciclo ya fue detenido por el usuario
-      if (!awaitingAck) {
-        clearInterval(reminderTimer);
-        reminderTimer = null;
-        return;
-      }
+  reminderTimer = setInterval(reminderTick, REMINDER_EVERY_MIN * 60 * 1000);
+}
 
-      // Verificar si aún estamos dentro del horario permitido
-      if (!isWithinOperatingHours()) {
-        logger.warn("⏹️ Fuera del horario permitido; deteniendo ciclo.");
-        await stopReminderCycleWithMessage("horario");
-        return;
-      }
-      if (reminderAttempts >= REMINDER_MAX_ATTEMPTS) {
-        logger.warn("⏹️ Tope de recordatorios alcanzado; deteniendo ciclo por hoy.");
-        clearInterval(reminderTimer);
-        reminderTimer = null;
-        awaitingAck = false;
-        return;
-      }
-      reminderAttempts++;
-      await sock.sendMessage(CHAT_ID_AUT, { text: MSG_RECORDATORIO });
-      logger.info(`📤 Recordatorio #${reminderAttempts} enviado.`);
-    } catch (err) {
-      logger.error({ err }, "Error enviando recordatorio periódico");
-    }
-  }, REMINDER_EVERY_MIN * 60 * 1000);
+// Pausa el timer del ciclo SIN resetear el estado (awaitingAck/reminderAttempts).
+// Se usa en reconexiones transitorias (código 428/500, no un logout ni un
+// corte por horario): antes, closeCurrentSocket() llamaba a stopReminderCycle()
+// para CUALQUIER motivo, así que un simple hiccup de red apagaba el ciclo de
+// recordatorios en silencio (sin mandar "sino no la tomés") y no se retomaba
+// hasta el día siguiente, porque el cron de inicio (23:30) ya había disparado.
+function pauseReminderTimer() {
+  if (reminderTimer) {
+    clearInterval(reminderTimer);
+    reminderTimer = null;
+  }
+}
+
+// Se llama cuando el socket vuelve a abrir. Si el ciclo seguía "activo"
+// (awaitingAck true) porque la desconexión fue transitoria, retoma el
+// intervalo donde había quedado en vez de perder la noche entera.
+function resumeReminderTimerIfNeeded() {
+  if (awaitingAck && !reminderTimer) {
+    logger.info(
+      { reminderAttempts },
+      "▶️ Retomando ciclo de recordatorios tras reconexión transitoria."
+    );
+    reminderTimer = setInterval(reminderTick, REMINDER_EVERY_MIN * 60 * 1000);
+  }
 }
 
 function stopReminderCycle(reason = "ack") {
@@ -260,7 +306,15 @@ async function closeCurrentSocket(reason = "close") {
       scheduledStopJob.cancel();
       scheduledStopJob = null;
     }
-    stopReminderCycle(reason);
+    // "reconnect" es un corte transitorio (428/500, hiccup de red): pausar el
+    // timer sin resetear awaitingAck/reminderAttempts, para poder retomar el
+    // ciclo apenas reconecte. Cualquier otro motivo (ack, horario, logout,
+    // scheduled_disconnect, max_retries) sí corta el ciclo de verdad.
+    if (reason === "reconnect") {
+      pauseReminderTimer();
+    } else {
+      stopReminderCycle(reason);
+    }
     if (sock) {
       try {
         sock.ev.removeAllListeners("connection.update");
@@ -370,6 +424,7 @@ async function start() {
       }
       lastQR = null;
       programarRecordatorio();
+      resumeReminderTimerIfNeeded();
     }
 
     if (connection === "close") {
@@ -439,6 +494,12 @@ async function start() {
 
       // 2) Ignorar mensajes enviados por el propio bot
       if (msg.key?.fromMe) return;
+
+      // 2.05) Ignorar mensajes ya procesados (reentrega de WhatsApp/Baileys)
+      if (alreadyProcessed(msg.key?.id)) {
+        logger.info({ id: msg.key?.id }, "🔁 Mensaje duplicado ignorado (ya procesado).");
+        return;
+      }
 
       // 2.1) Fuera de horario: ignorar todo sin logs ni respuestas
       if (!isWithinOperatingHours()) return;
